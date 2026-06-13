@@ -1,0 +1,102 @@
+#!/bin/bash
+set -uxo pipefail
+exec > /var/log/user-data.log 2>&1
+echo "=== user_data start $(date -u) ==="
+
+REGION="${region}"
+
+# --- deps -------------------------------------------------------------------
+dnf install -y python3 python3-pip || echo WARN_pip
+
+# --- X-Ray daemon (listens 127.0.0.1:2000, ships segments to X-Ray) ---------
+cd /tmp
+curl -s -o xray.rpm https://s3.us-east-2.amazonaws.com/aws-xray-assets.us-east-2/xray-daemon/aws-xray-daemon-3.x.rpm
+dnf install -y ./xray.rpm || yum install -y ./xray.rpm || echo WARN_xray_rpm
+systemctl enable --now xray || echo WARN_xray_svc
+
+# --- app venv (PEP668-safe; systemd needs a stable interpreter) --------------
+mkdir -p /opt/app
+python3 -m venv /opt/app/.venv
+/opt/app/.venv/bin/pip install --upgrade pip || echo WARN_pip_up
+/opt/app/.venv/bin/pip install flask boto3 aws-xray-sdk || echo WARN_pip_app
+
+# --- instrumented Flask app -------------------------------------------------
+cat > /opt/app/app.py <<'PYEOF'
+import os
+import boto3
+from flask import Flask, request, jsonify
+from aws_xray_sdk.core import xray_recorder, patch_all
+from aws_xray_sdk.ext.flask.middleware import XRayMiddleware
+
+REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
+
+# dynamic_naming='*' => the WebTier segment is named after the incoming Host
+# header (hypothesis D: a spoofed Host pollutes the service map node name).
+xray_recorder.configure(
+    service="WebTier",
+    dynamic_naming="*",
+    sampling=True,
+    context_missing="LOG_ERROR",
+)
+
+app = Flask(__name__)
+XRayMiddleware(app, xray_recorder)
+patch_all()  # instrument boto3 -> downstream node appears on the service map
+
+sts = boto3.client("sts", region_name=REGION)
+
+
+@app.route("/")
+def index():
+    # annotation = indexed/filterable ; metadata = stored but NOT filterable
+    xray_recorder.put_annotation("endpoint", "index")
+    xray_recorder.put_metadata("host_seen", request.host)
+    try:
+        sts.get_caller_identity()  # downstream AWS call -> 2nd node
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+
+@app.route("/health")
+def health():
+    return "ok"
+
+
+@app.route("/fault")
+def fault():
+    xray_recorder.put_annotation("endpoint", "fault")
+    return "boom", 500  # 5xx -> fault (hypothesis C)
+
+
+@app.route("/error")
+def err():
+    xray_recorder.put_annotation("endpoint", "error")
+    return "bad", 400  # 4xx -> error, NOT a fault
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, threaded=True)
+PYEOF
+
+# --- systemd service --------------------------------------------------------
+cat > /etc/systemd/system/todoapp.service <<EOF
+[Unit]
+Description=ToDo X-Ray demo app
+After=network.target xray.service
+[Service]
+Environment=AWS_DEFAULT_REGION=${region}
+Environment=AWS_REGION=${region}
+ExecStart=/opt/app/.venv/bin/python /opt/app/app.py
+Restart=always
+User=root
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now todoapp || echo WARN_app_svc
+
+# --- safety net: stop (not terminate) after N minutes -----------------------
+shutdown -h +${auto_stop_minutes} || true
+echo "=== user_data done $(date -u) ==="
