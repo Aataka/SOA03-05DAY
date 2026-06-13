@@ -166,21 +166,33 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 # ---------------------------------------------------------------------------
-# Hypothesis C: alarm on X-Ray group FaultRate.
-# Metric: AWS/X-Ray FaultRate, dimension GroupName. period 60s, 1/1.
+# Hypothesis C (pivot): X-Ray groups publish ONLY ApproximateTraceCount to
+# CloudWatch -- there is NO FaultRate metric. So to alarm on faults we make a
+# second group whose filter_expression keeps only fault traces; that group's
+# ApproximateTraceCount == number of fault traces. Alarm on >= 1.
 # ---------------------------------------------------------------------------
+resource "aws_xray_group" "faults" {
+  group_name        = "${var.name_prefix}-faults"
+  filter_expression = "fault = true"
+
+  insights_configuration {
+    insights_enabled      = false
+    notifications_enabled = false
+  }
+}
+
 resource "aws_cloudwatch_metric_alarm" "fault_rate" {
   alarm_name          = "${var.name_prefix}-fault-rate"
-  alarm_description   = "X-Ray group fault rate > 0 (5xx surfaced via traces)"
+  alarm_description   = "fault-filtered X-Ray group has >=1 trace (5xx surfaced via traces)"
   namespace           = "AWS/X-Ray"
-  metric_name         = "FaultRate"
-  dimensions          = { GroupName = aws_xray_group.todo.group_name }
-  statistic           = "Average"
+  metric_name         = "ApproximateTraceCount"
+  dimensions          = { GroupName = aws_xray_group.faults.group_name }
+  statistic           = "Sum"
   period              = 60
   evaluation_periods  = 1
   datapoints_to_alarm = 1
-  threshold           = 0
-  comparison_operator = "GreaterThanThreshold"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
   alarm_actions       = [aws_sns_topic.alarms.arn]
   ok_actions          = [aws_sns_topic.alarms.arn]
